@@ -1,12 +1,27 @@
+const { ethers } = require("hardhat");
+
 async function main() {
-  const [deployer] = await ethers.getSigners();
-  console.log("Deploying from:", deployer.address);
+  // --- config ---
+  const SAFE_ADDRESS = "0xb3d0D01FDCA7E78b7583aFf7010E5b40AA1c0bC2"; // your Safe address here
 
-  const HairsafeModule = await ethers.getContractFactory("HairsafeModule");
-  const module = await HairsafeModule.deploy("YOUR_SAFE_ADDRESS_HERE", "BENEFICIARY_ADDRESS_HERE", 157680000);  // 5 years
-  await module.deployed();
+  console.log("Deploying HeirSafeModule to Sepolia...");
+  const HeirSafeModule = await ethers.getContractFactory("HeirSafeModule");
+  const module = await HeirSafeModule.deploy();
+  await module.waitForDeployment();
 
-  console.log("HairsafeModule deployed to:", module.address);
+  const moduleAddr = await module.getAddress();
+  console.log(`Module deployed at: ${moduleAddr}`);
+
+  // Encode init params for setUp(bytes)
+  const abiCoder = ethers.AbiCoder.defaultAbiCoder();
+  const initParams = abiCoder.encode(["address"], [SAFE_ADDRESS]);
+
+  // Call setUp
+  const tx = await module.setUp(initParams);
+  await tx.wait();
+  console.log(`Module initialized for Safe: ${SAFE_ADDRESS}`);
+
+  console.log("Done!");
 }
 
 main().catch((error) => {

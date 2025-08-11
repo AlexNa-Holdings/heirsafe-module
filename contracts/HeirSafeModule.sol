@@ -1,117 +1,111 @@
 // SPDX-License-Identifier: MIT
 pragma solidity ^0.8.20;
 
-import "@gnosis.pm/zodiac/contracts/core/Module.sol";
-import "@openzeppelin/contracts-upgradeable/proxy/utils/Initializable.sol";
+import { Enum } from "@gnosis.pm/safe-contracts/contracts/common/Enum.sol";
+import { Module } from "@gnosis.pm/zodiac/contracts/core/Module.sol";
 
+// Minimal Safe surface we need
 interface ISafe {
     function getOwners() external view returns (address[] memory);
+    function isOwner(address) external view returns (bool);
 }
 
+/// Each Safe *owner* configures their own beneficiary + activation time via direct calls.
+/// No other owners influence it. The module executes the final owner swap *into the Safe*.
 contract HeirSafeModule is Module {
-    // Mapping to store each owner's beneficiary and activation timestamp
+    event BeneficiarySet(address indexed owner, address indexed beneficiary);
+    event ActivationTimeSet(address indexed owner, uint256 activationTime);
+
     struct HeirConfig {
         address beneficiary;
-        uint256 activationTimestamp;
+        uint256 activationTime;
     }
 
+    // Keyed by EOA owner address (not the Safe)
     mapping(address => HeirConfig) public heirConfigs;
 
-    event BeneficiarySet(address indexed owner, address indexed beneficiary);
-    event ActivationTimeSet(address indexed owner, uint256 newTimestamp);
-    event OwnerClaimed(address indexed oldOwner, address indexed newOwner);
+    /// Zodiac initializer (called by factory or manually in tests)
+    /// Expected data: abi.encode(address safe)
+    function setUp(bytes memory initParams) public override initializer {
+        address safe = abi.decode(initParams, (address));
+        require(safe != address(0), "Safe required");
 
-    // Initialize the module with Safe address
-    function setUp(bytes memory initializeParams) public override initializer {
-        // Set the deployer as the initial owner.
-        __Ownable_init(msg.sender);
-
-        // Now you can call owner-only functions.
-        address _safe = abi.decode(initializeParams, (address));
-        setAvatar(_safe);
-        setTarget(_safe);
-
-        // Finally, transfer ownership from the deployer to the Safe.
-        transferOwnership(_safe);
+        // In classic Zodiac, avatar is the Safe the module acts on; target often == avatar
+        __Ownable_init(msg.sender);             // Module’s own admin (Zodiac pattern)
+        avatar = safe;                          // where exec() sends txs
+        target = safe;                          // optional; keep equal to avatar for clarity
     }
 
-    // Any Safe owner sets their beneficiary and activation timestamp
-    function setBeneficiary(
-        address _beneficiary,
-        uint256 _activationTimestamp
-    ) external onlyOwner {
-        require(_beneficiary != address(0), "Invalid beneficiary address");
-        require(
-            _activationTimestamp > block.timestamp,
-            "Activation time must be in the future"
-        );
+    // ---------- owner-managed config (direct calls) ----------
 
-        heirConfigs[msg.sender] = HeirConfig({
-            beneficiary: _beneficiary,
-            activationTimestamp: _activationTimestamp
-        });
-        emit BeneficiarySet(msg.sender, _beneficiary);
-        emit ActivationTimeSet(msg.sender, _activationTimestamp);
+    function setBeneficiary(address beneficiary, uint256 activationTime) external {
+        require(_isSafeOwner(msg.sender), "Not a Safe owner");
+        require(beneficiary != address(0), "Invalid beneficiary");
+        require(activationTime > block.timestamp, "Activation must be future");
+
+        heirConfigs[msg.sender] = HeirConfig(beneficiary, activationTime);
+        emit BeneficiarySet(msg.sender, beneficiary);
+        emit ActivationTimeSet(msg.sender, activationTime);
     }
 
-    // Owner sets a new activation timestamp
-    function setActivationTime(
-        uint256 _newActivationTimestamp
-    ) external onlyOwner {
-        HeirConfig storage config = heirConfigs[msg.sender];
-        require(config.beneficiary != address(0), "No beneficiary set");
-        require(
-            _newActivationTimestamp > block.timestamp,
-            "New activation time must be in the future"
-        );
+    function removeBeneficiary() external {
+        require(_isSafeOwner(msg.sender), "Not a Safe owner");
+        HeirConfig storage cfg = heirConfigs[msg.sender];
+        require(cfg.beneficiary != address(0), "No beneficiary set");
 
-        config.activationTimestamp = _newActivationTimestamp;
-        emit ActivationTimeSet(msg.sender, _newActivationTimestamp);
+        delete heirConfigs[msg.sender];
+        emit BeneficiarySet(msg.sender, address(0));
     }
 
-    // Beneficiary claims ownership by replacing the specified owner
-    function claimSafe(address oldOwner) external {
-        HeirConfig memory config = heirConfigs[oldOwner];
-        require(
-            config.beneficiary != address(0),
-            "No beneficiary set for owner"
-        );
-        require(
-            msg.sender == config.beneficiary,
-            "Only designated beneficiary can claim"
-        );
-        require(
-            block.timestamp >= config.activationTimestamp,
-            "Activation time not reached"
-        );
+    function setActivationTime(uint256 newActivationTime) external {
+        require(_isSafeOwner(msg.sender), "Not a Safe owner");
+        HeirConfig storage cfg = heirConfigs[msg.sender];
+        require(cfg.beneficiary != address(0), "No beneficiary set");
+        require(newActivationTime > block.timestamp, "Activation must be future");
 
-        // Find prevOwner from Safe's owner list
-        address[] memory owners = ISafe(avatar).getOwners();
-        address prevOwner = address(0);
-        for (uint256 i = 0; i < owners.length; i++) {
-            if (owners[i] == oldOwner && i > 0) {
-                prevOwner = owners[i - 1];
-                break;
-            }
-        }
-        require(
-            prevOwner != address(0) || owners[0] == oldOwner,
-            "Owner not found in Safe"
-        );
+        cfg.activationTime = newActivationTime;
+        emit ActivationTimeSet(msg.sender, newActivationTime);
+    }
 
-        // Encode call to Safe's swapOwner function
+    // ---------- claiming flow ----------
+    // Safe’s swapOwner(prev, old, new) needs the previous owner in its internal list.
+    // We accept prevOwner as a parameter to avoid O(n) on-chain scanning.
+    function claimSafe(address owner, address prevOwner) external {
+        HeirConfig memory cfg = heirConfigs[owner];
+        require(cfg.beneficiary != address(0), "No beneficiary set for owner");
+        require(msg.sender == cfg.beneficiary, "Only beneficiary");
+        require(block.timestamp >= cfg.activationTime, "Activation time not reached");
+
+        // Build swapOwner(prevOwner, oldOwner, newOwner)
         bytes memory data = abi.encodeWithSignature(
             "swapOwner(address,address,address)",
             prevOwner,
-            oldOwner,
+            owner,
             msg.sender
         );
 
-        // Execute swapOwner on the Safe
-        exec(avatar, 0, data, Enum.Operation.Call);
-        emit OwnerClaimed(oldOwner, msg.sender);
+        // Use Zodiac’s exec helper — routes into Safe via execTransactionFromModule
+        // Enum.Operation.Call == 0
+        bool ok = exec(target, 0, data, Enum.Operation.Call);
+        require(ok, "Safe swapOwner failed");
 
-        // Clear the configuration to prevent reuse
-        delete heirConfigs[oldOwner];
+        delete heirConfigs[owner]; // one-shot
+    }
+
+
+
+
+    // ---------- helpers ----------
+
+    function _isSafeOwner(address who) internal view returns (bool) {
+        address safe = avatar;
+        // Prefer isOwner when available
+        try ISafe(safe).isOwner(who) returns (bool yes) {
+            return yes;
+        } catch {
+            address[] memory owners = ISafe(safe).getOwners();
+            for (uint256 i = 0; i < owners.length; i++) if (owners[i] == who) return true;
+            return false;
+        }
     }
 }
